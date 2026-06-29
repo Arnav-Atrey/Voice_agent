@@ -1,0 +1,8 @@
+python-dotenv
+duckduckgo_search
+google-genai
+sounddevice
+pymongo>=4.13
+beanie
+fastapi
+uvicorn
