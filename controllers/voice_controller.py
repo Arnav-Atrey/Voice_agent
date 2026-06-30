@@ -11,9 +11,9 @@ All console/transcript printing lives here too, replacing the old tkinter UI.
 Copilot dispatch is fire-and-forget: handle_tool_call() answers Gemini's
 function call immediately with an "in_progress" status, then runs the real
 Copilot session as a background asyncio.Task. When that finishes, the result
-is re-injected into the live session as a fresh user turn via
-session.send_client_content(), so Gemini can speak it without the receive
-loop — which also drives audio playback — ever blocking on Copilot.
+is re-injected into the live session via session.send_realtime_input(text=...)
+(same channel as the mic audio stream), so Gemini can speak it without the
+receive loop — which also drives audio playback — ever blocking on Copilot.
 """
 import asyncio
 
@@ -24,9 +24,11 @@ from google.genai import types as genai_types
 from config.settings import (
     CHANNELS,
     CHUNK_SIZE,
+    DEBUG_TOOL_LOGS,
     GEMINI_LIVE_MODEL,
     INPUT_SAMPLE_RATE,
     OUTPUT_SAMPLE_RATE,
+    USER_NAME,
     require_gemini_api_key,
 )
 from models.conversation import ConversationSession
@@ -40,6 +42,13 @@ from services.search_service import run_web_search
 # a task with no surviving reference can be silently cancelled). One set per
 # process is fine here since this is a single-session CLI agent.
 _background_tasks: set[asyncio.Task] = set()
+
+
+def _debug_print(*args, **kwargs) -> None:
+    """Print only when DEBUG_TOOL_LOGS is enabled — keeps the console to
+    just 'Agent: ...' transcript lines by default."""
+    if DEBUG_TOOL_LOGS:
+        print(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -139,9 +148,9 @@ async def _run_copilot_in_background(
         result = {"status": "error", "message": str(exc)}
 
     if result.get("status") == "ok":
-        print(f"[copilot background] done -> {result.get('output_file', 'n/a')}", flush=True)
+        _debug_print(f"[copilot background] done -> {result.get('output_file', 'n/a')}", flush=True)
     else:
-        print(f"[copilot background] failed -> {result.get('message', 'unknown error')}", flush=True)
+        _debug_print(f"[copilot background] failed -> {result.get('message', 'unknown error')}", flush=True)
     await history_service.add_message(db_session, "tool", f"run_copilot_task({task}) -> {result}")
 
     if result.get("status") == "ok":
@@ -183,7 +192,7 @@ async def handle_tool_call(session, tool_call, db_session: ConversationSession) 
     """
     responses = []
     for fc in tool_call.function_calls or []:
-        print(f"[tool] {fc.name}({dict(fc.args)})", flush=True)
+        _debug_print(f"[tool] {fc.name}({dict(fc.args)})", flush=True)
 
         if fc.name == "web_search":
             query = (fc.args or {}).get("query", "")
@@ -212,7 +221,7 @@ async def handle_tool_call(session, tool_call, db_session: ConversationSession) 
         else:
             result = {"error": f"Unknown tool: {fc.name}"}
 
-        print(f"       -> {result}", flush=True)
+        _debug_print(f"       -> {result}", flush=True)
         responses.append({"id": fc.id, "name": fc.name, "response": result})
 
     await session.send_tool_response(function_responses=responses)
@@ -303,6 +312,15 @@ async def run() -> None:
 
     try:
         async with client.aio.live.connect(model=GEMINI_LIVE_MODEL, config=config) as session:
+            greeting_who = f"the user, whose name is {USER_NAME}," if USER_NAME else "the user"
+            await session.send_realtime_input(
+                text=(
+                    "[System note, not from the user: this is the very start of "
+                    f"the session. Greet {greeting_who} by name if given, in one "
+                    "short friendly sentence, then ask what they'd like to work "
+                    "on or talk about today. Do not say anything else yet.]"
+                )
+            )
             await asyncio.gather(
                 audio_input_task(mic_queue),
                 audio_output_task(speaker_queue, interrupt_event),
