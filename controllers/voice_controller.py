@@ -7,6 +7,13 @@ Voice controller — orchestrates the live audio loop:
                                   +--> history_service (persists transcript to Mongo)
 
 All console/transcript printing lives here too, replacing the old tkinter UI.
+
+Copilot dispatch is fire-and-forget: handle_tool_call() answers Gemini's
+function call immediately with an "in_progress" status, then runs the real
+Copilot session as a background asyncio.Task. When that finishes, the result
+is re-injected into the live session as a fresh user turn via
+session.send_client_content(), so Gemini can speak it without the receive
+loop — which also drives audio playback — ever blocking on Copilot.
 """
 import asyncio
 
@@ -24,8 +31,15 @@ from config.settings import (
 )
 from models.conversation import ConversationSession
 from services import history_service
+from services.copilot_service import run_copilot_task
 from services.gemini_service import build_live_config
 from services.search_service import run_web_search
+
+# Background Copilot tasks must be kept referenced somewhere, or asyncio is
+# free to garbage-collect them mid-flight (a well-known asyncio footgun —
+# a task with no surviving reference can be silently cancelled). One set per
+# process is fine here since this is a single-session CLI agent.
+_background_tasks: set[asyncio.Task] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -94,11 +108,83 @@ async def send_audio_task(session, mic_queue: asyncio.Queue) -> None:
         )
 
 
+async def _run_copilot_in_background(
+    session, task: str, db_session: ConversationSession
+) -> None:
+    """
+    The actual Copilot call, run outside the receive loop. On completion,
+    injects the result back into the live session so Gemini picks it up and
+    speaks it on its own schedule.
+
+    Note: gemini-3.1-flash-live-preview does not yet support asynchronous
+    function calling (Google's own docs confirm this), so the model will not
+    generate anything further until *some* tool response is sent — that's
+    why handle_tool_call() answers with "in_progress" immediately, rather
+    than waiting for this function. This is also why the result is injected
+    via send_realtime_input(text=...) instead of send_client_content():
+    Google explicitly warns against mixing send_client_content with an
+    active send_realtime_input audio stream ("will lead to unpredictable
+    behavior and race conditions") — staying on the realtime channel avoids
+    that entirely.
+
+    If you ever switch GEMINI_LIVE_MODEL to gemini-2.5-flash-live-preview,
+    that model *does* support NON_BLOCKING function declarations with a
+    scheduling param (INTERRUPT/WHEN_IDLE/SILENT) — the officially
+    sanctioned version of this pattern. Worth migrating to if/when you
+    move models.
+    """
+    try:
+        result = await run_copilot_task(task)
+    except Exception as exc:
+        result = {"status": "error", "message": str(exc)}
+
+    if result.get("status") == "ok":
+        print(f"[copilot background] done -> {result.get('output_file', 'n/a')}", flush=True)
+    else:
+        print(f"[copilot background] failed -> {result.get('message', 'unknown error')}", flush=True)
+    await history_service.add_message(db_session, "tool", f"run_copilot_task({task}) -> {result}")
+
+    if result.get("status") == "ok":
+        injected_text = (
+            "[System note, not from the user: a background Copilot task just "
+            "finished. Summarize this for the user in 1-2 short spoken "
+            "sentences, mentioning the file was saved if relevant, next time "
+            "it's natural to speak.]\n"
+            f"Task: {task}\n"
+            f"Copilot's answer: {result.get('answer', '')}\n"
+            f"Saved to: {result.get('output_file', 'n/a')}"
+        )
+    else:
+        injected_text = (
+            "[System note, not from the user: the background Copilot task "
+            "failed. Briefly tell the user it didn't work and why, in 1 "
+            "short spoken sentence, next time it's natural to speak.]\n"
+            f"Task: {task}\n"
+            f"Error: {result.get('message', 'unknown error')}"
+        )
+
+    try:
+        await session.send_realtime_input(text=injected_text)
+    except Exception as exc:
+        # The Live session may already be closed (user hung up before
+        # Copilot finished) — this is expected sometimes, not a real error.
+        print(f"[copilot background] could not re-inject result: {exc}", flush=True)
+
+
 async def handle_tool_call(session, tool_call, db_session: ConversationSession) -> None:
-    """Run each requested function, log it, and send results back."""
+    """Run each requested function, log it, and send results back.
+
+    run_copilot_task is dispatched fire-and-forget: Gemini gets an
+    "in_progress" function response immediately (function calls must be
+    answered to keep the session's turn state consistent), and the real
+    work continues in a background task that re-injects its result later.
+    Everything else (web_search) still runs and responds synchronously,
+    since those calls are fast enough not to matter.
+    """
     responses = []
     for fc in tool_call.function_calls or []:
         print(f"[tool] {fc.name}({dict(fc.args)})", flush=True)
+
         if fc.name == "web_search":
             query = (fc.args or {}).get("query", "")
             try:
@@ -108,6 +194,21 @@ async def handle_tool_call(session, tool_call, db_session: ConversationSession) 
             await history_service.add_message(
                 db_session, "tool", f"web_search({query}) -> {result}"
             )
+
+        elif fc.name == "run_copilot_task":
+            task = (fc.args or {}).get("task", "")
+            result = {
+                "status": "in_progress",
+                "message": (
+                    "Copilot is working on this in the background. Tell the user "
+                    "you've kicked it off and you'll let them know when it's ready "
+                    "— do not wait or go silent."
+                ),
+            }
+            bg_task = asyncio.create_task(_run_copilot_in_background(session, task, db_session))
+            _background_tasks.add(bg_task)
+            bg_task.add_done_callback(_background_tasks.discard)
+
         else:
             result = {"error": f"Unknown tool: {fc.name}"}
 
@@ -213,4 +314,9 @@ async def run() -> None:
     except Exception as exc:
         print(f"Session error: {exc}", flush=True)
     finally:
+        # Give any in-flight Copilot background tasks a moment to finish
+        # logging to history before we close the DB session out from
+        # under them; don't hang forever if one stalls.
+        if _background_tasks:
+            await asyncio.wait(_background_tasks, timeout=5)
         await history_service.end_session(db_session)

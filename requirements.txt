@@ -6,3 +6,4 @@ pymongo>=4.13
 beanie
 fastapi
 uvicorn
+copilot
